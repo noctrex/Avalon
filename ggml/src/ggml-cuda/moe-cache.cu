@@ -6319,7 +6319,12 @@ static bool moe_split_copy_by_kernel() {
 }
 
 static bool moe_split_enabled() {
+#if defined(_WIN32)
+    // off by default: on Windows the GPU can hang in k_moe_split_wait until the driver resets it (TDR)
+    static const bool enabled = getenv("GGML_CUDA_MOE_SPLIT") && atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
+#else
     static const bool enabled = !getenv("GGML_CUDA_MOE_SPLIT") || atoi(getenv("GGML_CUDA_MOE_SPLIT")) != 0;
+#endif
     return enabled;
 }
 
