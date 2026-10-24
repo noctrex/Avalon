@@ -4532,6 +4532,7 @@ int ggml_cpu_has_sme2(void) {
 // of its own (its cache line stays in that L3), a group done taking what is left of the other half
 // (GGML_CPU_MOE_SCHED=dynamic: omp's dynamic schedule, one counter for the whole team)
 static int ggml_cpu_moe_l3_group(void) {
+#if defined(__linux__)
     static int8_t group[256];
     static bool init = false;
     if (!init) {
@@ -4552,6 +4553,9 @@ static int ggml_cpu_moe_l3_group(void) {
     }
     const int cpu = sched_getcpu();
     return cpu >= 0 && cpu < 256 ? group[cpu] : 0;
+#else
+    return 0;
+#endif
 }
 
 static inline int ggml_cpu_moe_l3_next(int * const * cnt, int g, int n_pairs, int n_ch) {
