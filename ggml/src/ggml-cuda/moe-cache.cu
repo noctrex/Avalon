@@ -5375,9 +5375,7 @@ static T * moe_hosted_device_ptr(T * host) {
 static unsigned long long * g_tl_h = nullptr;   // host view
 static unsigned long long * g_tl_m = nullptr;   // device view of the same memory
 static int64_t moe_tl_now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 static __device__ __forceinline__ unsigned long long moe_tl_clock() {
 #if defined(GGML_USE_HIP)
