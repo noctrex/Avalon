@@ -88,6 +88,9 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #  include <process.h>
 #elif defined(__linux__)
