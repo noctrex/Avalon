@@ -7021,6 +7021,11 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) 
 // Radeon's own link to the switch inside the card reads 16 GT/s x16 in any slot. Times the encoding (8b/10b up to
 // 5 GT/s, 128b/130b above), times the share a copy gets (moe_cache_pcie_copy_efficiency). 0 if the path cannot be read.
 static double moe_cache_pcie_bytes_per_us(int physical, std::string & desc) {
+#if !defined(__linux__)
+    GGML_UNUSED(physical);
+    GGML_UNUSED(desc);
+    return 0.0;
+#else
     char bus[32] = {};
     if (cudaDeviceGetPCIBusId(bus, sizeof(bus), physical) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -7068,6 +7073,7 @@ static double moe_cache_pcie_bytes_per_us(int physical, std::string & desc) {
              best * moe_cache_pcie_copy_efficiency);
     desc = text;
     return best * moe_cache_pcie_copy_efficiency * 1000.0;   // 1 GB/s = 1000 bytes per microsecond
+#endif
 }
 
 // the CPU rows' team: one thread per physical core the process may run on (its affinity mask, SMT siblings counted
