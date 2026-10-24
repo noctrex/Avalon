@@ -2300,7 +2300,7 @@ static bool moe_cache_prepare_budget(
 #if defined(GGML_USE_HIP)
     // the cache is sized from the amdgpu driver counters (sysfs), which hipMemGetInfo underestimates (+1.8 GiB of cache
     // on a 20 GiB card); falls back to the HIP figure if they cannot be read. GGML_CUDA_MOE_CACHE_FREE_SOURCE=hip keeps
-    // the HIP figure
+    // the HIP figure (on Windows also without the share of other processes)
     {
         const char * source = getenv("GGML_CUDA_MOE_CACHE_FREE_SOURCE");
         if (!source || strcmp(source, "hip") != 0) {
@@ -2314,6 +2314,14 @@ static bool moe_cache_prepare_budget(
                 MOE_CACHE_LOG("[moe-cache] CUDA%d free source=sysfs unavailable, using hip=%zu MiB\n",
                         device.physical, free_memory >> 20);
             }
+#if defined(_WIN32)
+            // on Windows hipMemGetInfo does not count the VRAM of other processes (desktop, browser: ~2.5 GiB). Past the
+            // physical VRAM, WDDM moves allocations to system RAM and the cache kernels read them over PCIe
+            constexpr size_t other_processes = (size_t) 3072 << 20;
+            free_memory = free_memory > other_processes ? free_memory - other_processes : 0;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d free minus %zu MiB for other processes: %zu MiB\n",
+                    device.physical, other_processes >> 20, free_memory >> 20);
+#endif
         }
     }
 #endif
