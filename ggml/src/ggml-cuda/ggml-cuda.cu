@@ -968,6 +968,22 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// hipMemcpy2DAsync copies zeros from a memory-mapped file on Windows: one copy per row there
+static cudaError_t ggml_cuda_memcpy_2d_h2d_async(void * dst, size_t dpitch, const void * src, size_t spitch,
+        size_t width, size_t height, cudaStream_t stream) {
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+    for (size_t i = 0; i < height; i++) {
+        const cudaError_t err = cudaMemcpyAsync((char *) dst + i*dpitch, (const char *) src + i*spitch, width, cudaMemcpyHostToDevice, stream);
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    return cudaSuccess;
+#else
+    return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyHostToDevice, stream);
+#endif
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -989,8 +1005,8 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(ggml_cuda_memcpy_2d_h2d_async(
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -3094,8 +3110,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(ggml_cuda_memcpy_2d_h2d_async(
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
