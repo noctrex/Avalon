@@ -251,9 +251,20 @@ static int ggml_cuda_parse_id(char devName[]) {
 // one is sized on its dispatch; ggml_cuda_prime_queues repeats the largest dispatch before the MoE cache is sized. An
 // explicit HSA_SCRATCH_SINGLE_LIMIT is kept.
 __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
+#ifdef _WIN32
+    const auto set_default = [](const char * name, const char * value) {
+        if (!getenv(name)) {
+            _putenv_s(name, value);
+        }
+    };
+    set_default("GPU_MAX_HW_QUEUES", "8");
+    set_default("ROCBLAS_DEVICE_MEMORY_SIZE", "65536");
+    set_default("HSA_SCRATCH_SINGLE_LIMIT", "1048576");
+#else
     setenv("GPU_MAX_HW_QUEUES", "8", /*overwrite =*/ 0);
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
+#endif
 }
 #elif !defined(GGML_USE_MUSA) && !defined(_WIN32)
 // CUDA loads a module lazily, at the first launch of one of its kernels (the default since CUDA 12.2), and loading it
