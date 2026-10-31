@@ -1531,6 +1531,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         defer_h[seq_id].clear();
     }
 
+    // the deferred rows of a seq are valid only right before pos: they are the positions just before the next row of
+    // the seq. Rows left by another request (one slot served in turn, the other request's state reloaded from the
+    // prompt cache) or by a cancelled prefill sit elsewhere and would be decoded at the head of the next batch: the
+    // draft's M-RoPE check then fails (#5). Those are dropped
+    void defer_keep_before(llama_seq_id seq_id, llama_pos pos) {
+        while (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() >= pos) {
+            defer_tok[seq_id].pop_back();
+            defer_pos[seq_id].pop_back();
+            defer_h[seq_id].resize(defer_h[seq_id].size() - n_embd);
+        }
+        if (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() + 1 != pos) {
+            defer_clear(seq_id);
+        }
+    }
+
     // add the deferred rows of a seq to the batch (no output)
     void defer_add(llama_seq_id seq_id) {
         for (size_t r = 0; r < defer_tok[seq_id].size(); ++r) {
@@ -1617,12 +1632,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     if (i_batch_beg[seq_id] >= 0) {
                         const llama_pos pos_beg = batch_in.tokens[i_batch_beg[seq_id]].pos[0];
                         llama_memory_seq_rm(mem_dft, seq_id, pos_beg, -1);
-                        // so is a deferred row there
-                        while (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() >= pos_beg) {
-                            defer_tok[seq_id].pop_back();
-                            defer_pos[seq_id].pop_back();
-                            defer_h[seq_id].resize(defer_h[seq_id].size() - n_embd);
-                        }
+                        // so is a deferred row there, and one not right before this batch is stale
+                        defer_keep_before(seq_id, pos_beg);
                     }
                 }
             }
@@ -1649,6 +1660,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     defer_h[seq_id].insert(defer_h[seq_id].end(), h_row, h_row + n_embd);
                 }
             } else {
+                // the deferred rows and a full ubatch do not fit in one batch of the draft (n_batch): the deferred rows
+                // are decoded first on their own (#7: a 9536-token ubatch after a verification aborted the process)
+                if (!chain_heads && n_deferred() > 0 && n_deferred() + n_tokens > (int32_t) llama_n_batch(ctx_dft)) {
+                    batch.clear();
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        defer_add(seq_id);
+                    }
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) of the deferred rows failed rc=%d\n", (int) rc);
+                        return false;
+                    }
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        defer_clear(seq_id);
+                    }
+                }
+
                 batch.clear();
 
                 // one sequence with nothing deferred before it: the target's rows stay on the device, the draft copies
@@ -1783,11 +1811,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // the catch-up rows process() deferred, in the same pass
-            while (!defer_pos[seq_id].empty() && defer_pos[seq_id].back() >= dp.pos0) {
-                defer_tok[seq_id].pop_back();
-                defer_pos[seq_id].pop_back();
-                defer_h[seq_id].resize(defer_h[seq_id].size() - n_embd);
-            }
+            defer_keep_before(seq_id, dp.pos0);
             defer_add(seq_id);
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
