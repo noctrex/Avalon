@@ -5371,16 +5371,15 @@ struct moe_hosted_state {
     double cal_measured = 0.0, cal_model = 0.0;
     // served by the thread that waits for the stream (ggml_cuda_moe_hosted_wait)
     std::mutex serve_mu;
-#if !defined(GGML_USE_HIP)
-    // CUDA: and by a thread of its own while blocks launched outside a graph capture are pending (moe_hosted_server).
+    // and by a thread of its own while blocks launched outside a graph capture are pending (moe_hosted_server).
     // The launching thread can block in a CUDA call that waits for the device (a full launch queue, a lazily loaded
-    // module, a first cuBLAS GEMM) while a block waits for its mailbox to be served: three hangs on an RTX 4090
+    // module, a first cuBLAS GEMM) while a block waits for its mailbox to be served: three hangs on an RTX 4090, and on
+    // HIP a first rocBLAS GEMM loading its Tensile code object (R9700, gfx1201, ROCm 7.1: every first prompt hung)
     std::thread server;
     std::mutex server_mu;
     std::condition_variable server_cv;
     uint32_t server_pending = 0;   // blocks launched outside a capture whose publication is not served yet
     std::atomic<bool> server_stop{false};
-#endif
     uint32_t last_seq = 0;
     std::vector<int32_t> cpu_rows, experts;
     std::vector<float> out, act;
@@ -7204,8 +7203,7 @@ static int moe_hosted_default_threads() {
     return std::max(1, hw / 2);
 }
 
-#if !defined(GGML_USE_HIP)
-// CUDA: serves the mailbox while blocks launched outside a capture are pending; asleep otherwise. The thread that waits
+// serves the mailbox while blocks launched outside a capture are pending; asleep otherwise. The thread that waits
 // for the stream serves it too (ggml_cuda_moe_hosted_wait): whoever holds serve_mu serves, the other one counts it
 static void moe_hosted_server(moe_hosted_state * st) {
     ggml_cuda_set_device(st->device->logical);
@@ -7256,7 +7254,6 @@ static void moe_hosted_server(moe_hosted_state * st) {
         }
     }
 }
-#endif // !defined(GGML_USE_HIP)
 
 static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_cache_device & device) {
     std::lock_guard<std::mutex> lock(g_hosted_mu);
@@ -7306,9 +7303,7 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
             GGML_LOG_INFO("moe timeline: GPU wall clock %d kHz\n", rate_khz);
         }
     }
-#if !defined(GGML_USE_HIP)
     st->server = std::thread(moe_hosted_server, st.get());
-#endif
     entry = std::move(st);
     return entry.get();
 }
@@ -7330,7 +7325,6 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
         if (!st) {
             continue;
         }
-#if !defined(GGML_USE_HIP)
         if (st->server.joinable()) {
             {
                 std::lock_guard<std::mutex> lock(st->server_mu);
@@ -7339,7 +7333,6 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
             st->server_cv.notify_one();
             st->server.join();
         }
-#endif
         for (void * h : {(void *) st->h_act, (void *) st->h_act8, (void *) st->h_res, (void *) st->h_ids, (void *) st->h_plan,
                          (void *) st->h_plan2}) {
             if (h) cudaFreeHost(h);
@@ -7664,7 +7657,6 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                               (int32_t *) ids->data, ids->nb[1], layer->m_ids, n_used, n_tokens,
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
                                               layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta);
-#if !defined(GGML_USE_HIP)
     // a block launched now (not recorded into a graph) waits for its mailbox: the server thread serves it
     {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
@@ -7677,7 +7669,6 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         }
         (void) cudaGetLastError();
     }
-#endif // !defined(GGML_USE_HIP)
     if (tk) {
         tp.logits = nullptr;
     }
