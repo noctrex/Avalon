@@ -6335,7 +6335,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             static const bool depchain = getenv("GGML_CUDA_DEPCHAIN") && atoi(getenv("GGML_CUDA_DEPCHAIN")) > 0;
             std::vector<std::pair<int, int>> units;
             static const bool mk_enabled = !getenv("GGML_CUDA_MK") || atoi(getenv("GGML_CUDA_MK")) > 0;   // GGML_CUDA_MK=0: off
-            if (mk_enabled) {
+            // a prompt's batch runs its nodes' own kernels: the chains bound their blocks to what stays resident (the
+            // GDN's recurrence of 9536 tokens 8.5 -> 18 ms a layer), prefill 1505 - 1514 -> 1557 - 1563 t/s without them
+            // at 19k; generation keeps them (a verification pass 20.6 -> 20.0 ms). GGML_CUDA_MK_MAX_TOKENS=N: the bound
+            static const int64_t mk_max_tokens = getenv("GGML_CUDA_MK_MAX_TOKENS") ? atoll(getenv("GGML_CUDA_MK_MAX_TOKENS")) : 64;
+            int64_t graph_tokens = 0;
+            for (int i = 0; i < cgraph->n_nodes && graph_tokens == 0; i++) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                if (n->op == GGML_OP_GATED_DELTA_NET) {
+                    graph_tokens = n->src[2]->ne[2];
+                } else if (n->op == GGML_OP_FLASH_ATTN_EXT) {
+                    graph_tokens = n->src[0]->ne[1];
+                }
+            }
+            cuda_ctx->mk = nullptr;
+            if (mk_enabled && graph_tokens <= mk_max_tokens) {
                 if (!cuda_ctx->mk_owned) {
                     cuda_ctx->mk_owned = new ggml_cuda_mk();
                 }
