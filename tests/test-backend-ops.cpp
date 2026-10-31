@@ -5438,6 +5438,12 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    // the chunked recurrence of a long batch rounds its operands to FP16 (ggml-cuda's gdn-wmma.cu on RDNA3):
+    // NMSE 1.03e-7 at 2048 tokens of Qwen3.8's shape, 2.8e-7 at 9536
+    double max_nmse_err() override {
+        return head_size == 128 && n_seq_tokens >= 128 && !kda ? 5e-7 : 1e-7;
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -13484,6 +13490,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  65, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
+    // Qwen3.8's shape (16 key heads, 48 value heads, S 128): a prompt batch of one sequence takes the chunked kernels on RDNA3
+    for (int64_t n : { 129, 257, 513, 2048 }) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));

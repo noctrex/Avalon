@@ -3,6 +3,8 @@
 
 #include "gdn-body.cuh"
 #include "mk.cuh"
+#include "gdn-wmma.cuh"
+#include "ggml-backend-impl.h"
 
 template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp, bool replay = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -177,6 +179,19 @@ static void ggml_cuda_op_gated_delta_net_impl(
         return;
     }
 
+    if (ggml_cuda_gdn_wmma_usable(dst)) {
+        // a long batch of one sequence: the chunked recurrence on the matrix cores (gdn-wmma.cu), its T and P in the
+        // scheduler's scratch (GGML_SCHED_SCRATCH_SRC) when it gave one, else pool memory
+        ggml_cuda_gdn_wmma_args wa = { q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, nullptr, n_tokens,
+                                       sq1, sq2, sv1, sv2, sb1, sb2, state_ids, state_row_stride };
+        const ggml_tensor * scratch_t = dst->src[GGML_SCHED_SCRATCH_SRC];
+        const size_t        need      = ggml_cuda_gdn_wmma_scratch_size(n_tokens);
+        ggml_cuda_pool_alloc<char> pool_scratch(ctx.pool());
+        wa.scratch = scratch_t && ggml_nbytes(scratch_t) >= need ? scratch_t->data : (void *) pool_scratch.alloc(need);
+        ggml_cuda_gdn_wmma_launch(wa, stream);
+        return;
+    }
+
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
@@ -205,6 +220,9 @@ bool ggml_cuda_gdn_mk_recordable(const ggml_tensor * dst) {
     const ggml_tensor * v = dst->src[2];
     const ggml_tensor * g = dst->src[3];
     const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    if (ggml_cuda_gdn_wmma_usable(dst)) {
+        return false; // the chunked kernels run alone
+    }
     if (S_v != 128 || g->ne[0] == S_v || ggml_get_op_params_i32(dst, 0) > 1 || dst->src[6] != nullptr || n_tokens == 1 ||
             ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32) {
         return false;
