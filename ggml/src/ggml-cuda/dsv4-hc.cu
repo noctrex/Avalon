@@ -100,52 +100,53 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
+// a thread per (column, token): grid x the column blocks, grid y the tokens (looped past the grid's limit)
 template <bool gated>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
         float * dst,
-        int64_t n_embd,
-        int64_t hc,
-        int64_t n_tokens,
-        int64_t sx0,
-        int64_t sx1,
+        int n_embd,
+        int hc,
+        int n_tokens,
+        int sx0,
+        int sx1,
         int64_t sx2,
-        int64_t sw0,
-        int64_t sw1,
+        int sw0,
+        int sw1,
         int64_t sw2,
-        int64_t sd0,
+        int sd0,
         int64_t sd1,
         float   scale) {
     ggml_cuda_pdl_lc();
-    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t nr = n_embd * n_tokens;
-
-    if (ir >= nr) {
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i0 >= n_embd) {
         return;
     }
 
     ggml_cuda_pdl_sync();
 
-    const int64_t i0 = ir % n_embd;
-    const int64_t it = ir / n_embd;
-
-    float sum = 0.0f;
-    for (int64_t ih = 0; ih < hc; ++ih) {
-        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
-        float wv;
-        if constexpr (gated) {
-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
-        } else {
-            wv = weights[ih*sw0 + it*sw1];
+    for (int it = blockIdx.y; it < n_tokens; it += gridDim.y) {
+        float sum = 0.0f;
+        for (int ih = 0; ih < hc; ++ih) {
+            const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+            float wv;
+            if constexpr (gated) {
+                wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            } else {
+                wv = weights[ih*sw0 + it*sw1];
+            }
+            sum += xv * wv;
         }
-        sum += xv * wv;
-    }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+        dst[i0*sd0 + it*sd1] = scale * sum;
+    }
 }
 
 // gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
+// a thread per (column, token) computes the column's hc streams, reading the residual's hc values once; the same
+// arithmetic, in the same order, as one thread per output
+constexpr int DSV4_HC_POST_MAX = 8;
 template <bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
@@ -153,53 +154,56 @@ static __global__ void dsv4_hc_post_f32(
         const float * post,
         const float * comb,
         float * dst,
-        int64_t n_embd,
-        int64_t hc,
-        int64_t n_tokens,
-        int64_t sx0,
+        int n_embd,
+        int hc,
+        int n_tokens,
+        int sx0,
         int64_t sx1,
-        int64_t sr0,
-        int64_t sr1,
+        int sr0,
+        int sr1,
         int64_t sr2,
-        int64_t sp0,
+        int sp0,
         int64_t sp1,
-        int64_t sc0,
-        int64_t sc1,
+        int sc0,
+        int sc1,
         int64_t sc2,
-        int64_t sd0,
-        int64_t sd1,
+        int sd0,
+        int sd1,
         int64_t sd2,
         float gate_scale_in,
         float gate_scale_out) {
     ggml_cuda_pdl_lc();
-    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t nr = n_embd * hc * n_tokens;
-
-    if (ir >= nr) {
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i0 >= n_embd) {
         return;
     }
 
     ggml_cuda_pdl_sync();
 
-    const int64_t i0   = ir % n_embd;
-    const int64_t idst = (ir / n_embd) % hc;
-    const int64_t it   = ir / (n_embd * hc);
-
-    float p = post[idst*sp0 + it*sp1];
-    if constexpr (gated) {
-        p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
-    }
-
-    float sum = x[i0*sx0 + it*sx1] * p;
-    if constexpr (has_comb) {
-        for (int64_t isrc = 0; isrc < hc; ++isrc) {
-            sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+    for (int it = blockIdx.y; it < n_tokens; it += gridDim.y) {
+        const float xv = x[i0*sx0 + it*sx1];
+        float r[DSV4_HC_POST_MAX];
+        for (int isrc = 0; isrc < hc; ++isrc) {
+            r[isrc] = residual[i0*sr0 + isrc*sr1 + it*sr2];
         }
-    } else {
-        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
-    }
+        for (int idst = 0; idst < hc; ++idst) {
+            float p = post[idst*sp0 + it*sp1];
+            if constexpr (gated) {
+                p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+            }
 
-    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+            float sum = xv * p;
+            if constexpr (has_comb) {
+                for (int isrc = 0; isrc < hc; ++isrc) {
+                    sum += r[isrc] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+                }
+            } else {
+                sum += r[idst];
+            }
+
+            dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+        }
+    }
 }
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -265,9 +269,8 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     const int block_size = 256;
-    const int64_t nr = n_embd * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const dim3 grid_dims((n_embd + block_size - 1) / block_size, (unsigned) std::min<int64_t>(n_tokens, 65535), 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
@@ -312,10 +315,11 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    GGML_ASSERT(hc <= DSV4_HC_POST_MAX);
+
     const int block_size = 256;
-    const int64_t nr = n_embd * hc * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const dim3 grid_dims((n_embd + block_size - 1) / block_size, (unsigned) std::min<int64_t>(n_tokens, 65535), 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     auto kernel = comb ? (gated ? dsv4_hc_post_f32<true,  true> : dsv4_hc_post_f32<true,  false>)
