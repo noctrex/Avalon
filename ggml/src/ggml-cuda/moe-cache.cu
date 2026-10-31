@@ -93,6 +93,10 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #  endif
 #  include <windows.h>
 #  include <process.h>
+#  if defined(GGML_USE_HIP)
+#    include <winternl.h>   // NTSTATUS, for d3dkmthk.h
+#    include <d3dkmthk.h>   // D3DKMTQueryStatistics: the VRAM resident for every process
+#  endif
 #elif defined(__linux__)
 #  include <fcntl.h>
 #  include <sched.h>
@@ -2281,6 +2285,61 @@ static bool moe_cache_sysfs_free(int physical, size_t & free_out, size_t & total
 }
 #endif
 
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+// the free VRAM of the device's adapter by WDDM's segment statistics, every process counted (hipMemGetInfo counts only
+// this one's: the desktop and a browser held ~2.5 GiB on a 24 GiB card, and past the physical VRAM WDDM moves
+// allocations to system memory, the cache read over PCIe): the local segments' commit limit minus their resident
+// bytes. The adapter is found by the LUID HIP gives; D3DKMTQueryStatistics is taken from gdi32 at run time.
+static bool moe_cache_d3dkmt_free(int physical, size_t & free_out, size_t & total_out) {
+    using query_fn = NTSTATUS (APIENTRY *)(const D3DKMT_QUERYSTATISTICS *);
+    static const query_fn query = [] {
+        HMODULE gdi = LoadLibraryA("gdi32.dll");
+        return gdi ? (query_fn) GetProcAddress(gdi, "D3DKMTQueryStatistics") : nullptr;
+    }();
+    if (!query) {
+        return false;
+    }
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, physical) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    LUID luid;
+    static_assert(sizeof(luid) == sizeof(prop.luid), "LUID size");
+    memcpy(&luid, prop.luid, sizeof(luid));
+
+    D3DKMT_QUERYSTATISTICS q = {};
+    q.Type        = D3DKMT_QUERYSTATISTICS_ADAPTER;
+    q.AdapterLuid = luid;
+    if (query(&q) != 0) {
+        return false;
+    }
+    const ULONG nsegments = q.QueryResult.AdapterInformation.NbSegments;
+    unsigned long long limit = 0, resident = 0;
+    for (ULONG i = 0; i < nsegments; ++i) {
+        D3DKMT_QUERYSTATISTICS qs = {};
+        qs.Type                   = D3DKMT_QUERYSTATISTICS_SEGMENT;
+        qs.AdapterLuid            = luid;
+        qs.QuerySegment.SegmentId = i;
+        if (query(&qs) != 0) {
+            return false;
+        }
+        const D3DKMT_QUERYSTATISTICS_SEGMENT_INFORMATION & seg = qs.QueryResult.SegmentInformation;
+        if (seg.Aperture) {
+            continue;   // system memory seen through the GPU's aperture
+        }
+        limit    += seg.CommitLimit;
+        resident += seg.BytesResident;
+    }
+    if (limit == 0) {
+        return false;
+    }
+    total_out = (size_t) limit;
+    free_out  = resident < limit ? (size_t) (limit - resident) : 0;
+    return true;
+}
+#endif
+
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
     if (device.budget_ready) {
@@ -2315,12 +2374,20 @@ static bool moe_cache_prepare_budget(
                         device.physical, free_memory >> 20);
             }
 #if defined(_WIN32)
-            // on Windows hipMemGetInfo does not count the VRAM of other processes (desktop, browser: ~2.5 GiB). Past the
-            // physical VRAM, WDDM moves allocations to system RAM and the cache kernels read them over PCIe
-            constexpr size_t other_processes = (size_t) 3072 << 20;
-            free_memory = free_memory > other_processes ? free_memory - other_processes : 0;
-            MOE_CACHE_LOG("[moe-cache] CUDA%d free minus %zu MiB for other processes: %zu MiB\n",
-                    device.physical, other_processes >> 20, free_memory >> 20);
+            // hipMemGetInfo does not count the VRAM of other processes: the free VRAM by WDDM's statistics, read once
+            // when the cache is sized; failing that, 3072 MiB left to them (the desktop and a browser held ~2.5 GiB)
+            size_t d3d_free  = 0;
+            size_t d3d_total = 0;
+            if (moe_cache_d3dkmt_free(device.physical, d3d_free, d3d_total)) {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d free source=d3dkmt: hip=%zu MiB d3dkmt=%zu MiB (total %zu MiB)\n",
+                        device.physical, free_memory >> 20, d3d_free >> 20, d3d_total >> 20);
+                free_memory = std::min(free_memory, d3d_free);
+            } else {
+                constexpr size_t other_processes = (size_t) 3072 << 20;
+                free_memory = free_memory > other_processes ? free_memory - other_processes : 0;
+                MOE_CACHE_LOG("[moe-cache] CUDA%d free source=d3dkmt unavailable, hip minus %zu MiB for other processes: %zu MiB\n",
+                        device.physical, other_processes >> 20, free_memory >> 20);
+            }
 #endif
         }
     }
