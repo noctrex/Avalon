@@ -3673,7 +3673,7 @@ static bool ggml_cuda_match_conv_cached(const ggml_cgraph * cgraph, int ci, ggml
     const ggml_tensor * root = ggml_cuda_view_root(state);
     if (n_cols != 3 || state->type != GGML_TYPE_F32 || !ggml_is_contiguous(state) || state->ne[3] != 1 ||
             x->type != GGML_TYPE_F32 || x->ne[1] != n_ch || x->ne[2] != n_s || x->ne[3] != 1 ||
-            n_t < 1 || n_t > GGML_CUDA_SSM_CONV_CACHED_MAX_T || !root || !ggml_is_contiguous(root) ||
+            n_t < 1 || (n_t > GGML_CUDA_SSM_CONV_CACHED_MAX_T && n_s != 1) || !root || !ggml_is_contiguous(root) ||
             ggml_nelements(root) != ggml_nelements(state)) {
         return false;
     }
@@ -3750,7 +3750,8 @@ static bool ggml_cuda_match_conv_cached(const ggml_cgraph * cgraph, int ci, ggml
     // ggml-alloc may give the output the memory of x (dead once the window is built): a thread loads its
     // channel of x for every token before writing, and element (t, c) of the output sits where element
     // (t, c) of x does when x is the transposed [n_ch, n_t] tensor, so that exact alias is safe
-    const bool x_alias_ok = m.out->data == x->data && x->nb[1] == sizeof(float) &&
+    // (not for a prompt's batch: its chunks read the inputs before them, which the previous chunk's outputs overwrite)
+    const bool x_alias_ok = n_t <= GGML_CUDA_SSM_CONV_CACHED_MAX_T && m.out->data == x->data && x->nb[1] == sizeof(float) &&
                             x->nb[0] == (size_t) n_ch * sizeof(float) && x->nb[2] == (size_t) (n_ch * n_t) * sizeof(float);
     for (const ggml_tensor * r : reads) {
         if (r == root && root_absorbed && root->op == GGML_OP_GET_ROWS) {

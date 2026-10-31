@@ -219,10 +219,73 @@ static __global__ void ssm_conv_cached_f32(const ssm_conv_cached_args a) {
     ssm_conv_cached_body<d_conv, max_t>(a, blockIdx.x, blockIdx.y, threadIdx.x);
 }
 
+// a prompt's batch: ssm_conv_cached_body over chunks of max_t tokens (the grid's z), a thread per channel; the window
+// before a chunk read from x (the state for the first), the slots written by the first chunk's threads after their
+// read of the state (from the state and x: x is not the output here). One sequence.
+template <int d_conv, int max_t>
+static __global__ void ssm_conv_cached_long_f32(const ssm_conv_cached_args a) {
+    const float * state = a.state; const int32_t * ids = a.ids;
+    const char * x = a.x; const int64_t x_nb0 = a.x_nb0, x_nb1 = a.x_nb1;
+    const float * w = a.w; float * dst = a.dst;
+    const int64_t n_ch = a.n_ch, n_t = a.n_t;
+    const int tid = threadIdx.x;
+    const int64_t c  = (int64_t) blockIdx.x * 128 + tid;
+    const int64_t t0 = (int64_t) blockIdx.z * max_t;
+    const bool qk = a.qk_out != nullptr && (int64_t) blockIdx.x * 128 < a.n_qk;
+    if (c >= n_ch) {
+        return;
+    }
+    __shared__ float qk_sum[32];
+    const float * st = state + (ids != nullptr ? (int64_t) ids[0] : 0) * a.state_row + c * (d_conv - 1);
+    // the window: input t0 - (d_conv - 1) + k at k, from the state before the batch
+    const auto input = [&](int64_t g) {   // g: column of concat(state, x), 0 <= g < d_conv - 1 + n_t
+        return g < d_conv - 1 ? st[g] : *(const float *) (x + (g - (d_conv - 1)) * x_nb0 + c * x_nb1);
+    };
+    const int64_t n = min((int64_t) max_t, n_t - t0);
+    float win[d_conv - 1 + max_t];
+#pragma unroll
+    for (int k = 0; k < d_conv - 1 + max_t; k++) {
+        win[k] = k < d_conv - 1 + n ? input(t0 + k) : 0.0f;
+    }
+    float wc[d_conv];
+#pragma unroll
+    for (int k = 0; k < d_conv; k++) {
+        wc[k] = w[c * (a.w_nb1 / sizeof(float)) + k];
+    }
+    for (int64_t t = 0; t < n; t++) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int k = 0; k < d_conv; k++) {
+            sumf += win[t + k] * wc[k];
+        }
+        sumf += 0.0f;   // the bias term of ssm_conv_f32, absent here: same rounding
+        const float y = a.apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        dst[(t0 + t) * n_ch + c] = y;
+        if (qk) {
+            float sq = block_reduce<block_reduce_method::SUM, 128>(y * y, qk_sum);
+            const float scale = rsqrtf(sq / 128 + a.qk_eps);
+            a.qk_out[(t0 + t) * a.n_qk + c] = a.qk_scale * (scale * y);
+            __syncthreads();   // qk_sum is reused by the next token
+        }
+    }
+    if (blockIdx.z == 0) {
+        for (int k = 0; k < a.slots.n; k++) {
+            float tail[d_conv - 1];
+            for (int j = 0; j < d_conv - 1; j++) {
+                tail[j] = input(a.slots.tail_col[k] + j);
+            }
+            float * row = (float *) a.slots.dst[k] + c * (d_conv - 1);
+            for (int j = 0; j < d_conv - 1; j++) {
+                row[j] = tail[j];
+            }
+        }
+    }
+}
+
 void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float * state, const int32_t * ids, int64_t state_row,
         const ggml_tensor * x, const ggml_tensor * w, float * dst, int64_t n_ch, int64_t n_t, int64_t n_s, bool apply_silu,
         const ggml_cuda_ssm_conv_slots & slots, float * qk_out, int64_t n_qk, float qk_eps, float qk_scale) {
-    GGML_ASSERT(w->ne[0] == 4 && n_t <= GGML_CUDA_SSM_CONV_CACHED_MAX_T);
+    GGML_ASSERT(w->ne[0] == 4 && (n_t <= GGML_CUDA_SSM_CONV_CACHED_MAX_T || n_s == 1));
     const int threads = 128;
     GGML_ASSERT(qk_out == nullptr || (n_qk % threads == 0 && n_qk <= n_ch));
     const dim3 grid((n_ch + threads - 1) / threads, n_s, 1);
@@ -231,6 +294,12 @@ void ggml_cuda_op_ssm_conv_cached(ggml_backend_cuda_context & ctx, const float *
     a.x = (const char *) x->data; a.x_nb0 = x->nb[0]; a.x_nb1 = x->nb[1]; a.x_nb2 = x->nb[2];
     a.w = (const float *) w->data; a.w_nb1 = w->nb[1]; a.dst = dst; a.n_ch = n_ch; a.n_t = n_t; a.apply_silu = apply_silu;
     a.slots = slots; a.qk_out = qk_out; a.n_qk = n_qk; a.qk_eps = qk_eps; a.qk_scale = qk_scale; a.n_s = (int) n_s;
+    if (n_t > GGML_CUDA_SSM_CONV_CACHED_MAX_T) {
+        const dim3 grid_long((n_ch + threads - 1) / threads, 1,
+                             (n_t + GGML_CUDA_SSM_CONV_CACHED_MAX_T - 1) / GGML_CUDA_SSM_CONV_CACHED_MAX_T);
+        ssm_conv_cached_long_f32<4, GGML_CUDA_SSM_CONV_CACHED_MAX_T><<<grid_long, threads, 0, ctx.stream()>>>(a);
+        return;
+    }
     if (ctx.mk && ggml_cuda_mk_add_ssm_conv(ctx.mk, a)) {   // the multi-task kernel takes it (mk.cuh)
         return;
     }

@@ -13439,6 +13439,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_cached(256, 3, 3));
     test_cases.emplace_back(new test_ssm_conv_cached(10240, 1, 1, 4096));
     test_cases.emplace_back(new test_ssm_conv_cached(10240, 3, 3, 4096));
+    // a prompt batch: the chunked kernel (chunks of 16 tokens, the window before a chunk read from x)
+    test_cases.emplace_back(new test_ssm_conv_cached(256, 17, 1));
+    test_cases.emplace_back(new test_ssm_conv_cached(256, 100, 3));
+    test_cases.emplace_back(new test_ssm_conv_cached(10240, 1000, 1, 4096));
+    test_cases.emplace_back(new test_ssm_conv_cached(10240, 100, 3, 4096));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 256, 1, {64, 48, 8, 0}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, 3, {1024, 48, 48, 512}));
     test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q4_K, 512, 2, {64, 40, 0, 0}));
